@@ -26,6 +26,7 @@ class StageResult:
     cost: float
     success: bool
     message: str
+    jacobian: np.ndarray | None = None  # scipy least_squares の res.jac（不確かさ評価用）
 
 
 def run_staged_optimization(

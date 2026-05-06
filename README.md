@@ -1,141 +1,426 @@
 # Robot Calibration Library
 
-ロボットアームのキャリブレーションを行うPythonライブラリ。DHパラメータ誤差、ツール変換誤差、ローカル変換誤差、時刻ずれ、関節伝達誤差を最小二乗法で同定します。
+ロボットアームのキャリブレーションを行う Python ライブラリ。  
+DH パラメータ誤差・ツール変換誤差・ベース座標系誤差・時刻ずれ・関節伝達誤差を最小二乗法で同定します。  
+ラプラス近似による不確かさ評価と Before/After サマリーグラフ出力に対応しています。
 
-## 特徴
+---
 
-- **段階的最適化**: パラメータをグループ化して順次推定
-- **不確かさ評価**: ラプラス近似によるパラメータの標準偏差推定
-- **柔軟な観測モデル**: 位置観測、速度ノルム、FFT周波数成分に対応
-- **シミュレーションテスト**: 包括的な検証スイート
+## アーキテクチャ
+
+実験ごとに **レシピファイル** (`recipe_*.py`) を 1 つ作成するだけで実験が完結します。  
+骨格コード (`estimation/`, `io/`, `visualization/`) は一切触りません。
+
+```
+calib/
+├── recipe_ur5_calibration.py      ← ランダム軌道からの DH / ツール / ベース誤差同定
+├── recipe_straight_line_calib.py  ← 直線軌道（500 Hz 高レート）+ 時刻ずれ同定
+├── recipe_ballbar.py              ← ボールバー距離計測による同定・識別可能性評価
+├── recipe_transmission_error.py   ← 関節伝達誤差を含む段階的キャリブレーション
+└── robot_calibration/
+    ├── pipeline.py                ← run_calibration / compute_uncertainty
+    ├── models/
+    │   ├── base.py                ← KinematicModel / ObservationModel (ABC)
+    │   ├── defaults.py            ← DHKinematics / PoseObservation / DistanceObservation
+    │   ├── parameters.py          ← Parameter / ParameterSet
+    │   └── transforms.py          ← ObservationTransform 各種
+    ├── estimation/
+    │   ├── optimizer.py           ← Stage / StageResult
+    │   └── uncertainty.py         ← laplace_uncertainty / UncertaintyResult
+    ├── visualization/
+    │   └── plotter.py             ← plot_calibration_summary など
+    └── io/
+        └── loader.py              ← CSV 読み込み / 保存
+```
+
+---
 
 ## インストール
-
-### Conda環境のセットアップ
 
 ```bash
 conda env create -f environment.yml
 conda activate calib
 ```
 
-### 依存関係
+**依存関係**: Python >= 3.11, NumPy, SciPy, Matplotlib
 
-- Python >= 3.11
-- NumPy
-- SciPy
-- Matplotlib
+---
 
-## 使い方
-
-### 基本的なキャリブレーション手順
-
-1. **データ準備**: 関節角度軌道と対応するエンドエフェクタ位置観測データをCSV形式で準備
-2. **パラメータセット作成**: 推定対象パラメータを定義
-3. **最適化実行**: 段階的最適化でパラメータを推定
-4. **結果評価**: 残差改善とパラメータ不確かさを確認
-
-### サンプルコード
+## 典型的なワークフロー
 
 ```python
 import numpy as np
-from robot_calibration.models.parameters import make_default_parameter_set
-from robot_calibration.models.kinematics import DH_NOMINAL  # または独自のDHパラメータ
-from robot_calibration.estimation.optimizer import run_staged_optimization, default_stages
+from robot_calibration import (
+    run_calibration, compute_uncertainty,
+    DHKinematics, PoseObservation, Parameter, Stage,
+)
+from robot_calibration.models.transforms import IdentityTransform
+from robot_calibration.visualization.plotter import plot_calibration_summary
 from robot_calibration.io.loader import load_joint_trajectory, load_position_observations
 
-# 1. データ読み込み
-q_times, q_traj = load_joint_trajectory("joint_trajectory.csv")  # (N, 6)
-obs_times, p_exp = load_position_observations("position_observations.csv")  # (N, 3)
+# 1. ロボット・モデル定義
+DH_NOMINAL = [...]   # Modified DH パラメータ（6 リンク分）
+KIN = DHKinematics(DH_NOMINAL)
+OBS = PoseObservation()
 
-# 2. パラメータセット作成
-ps = make_default_parameter_set(DH_NOMINAL)
-param_lookup = {p.name: i for i, p in enumerate(ps.params)}
-
-# 3. 最適化実行
-stages = default_stages()  # デフォルトの3ステージ
-results = run_staged_optimization(
-    stages=stages,
-    params=ps,
-    dh_nominal=DH_NOMINAL,
-    param_lookup=param_lookup,
-    q_traj=q_traj,
-    p_exp=p_exp,
-    q_timestamps=q_times,  # time_offset推定時は必要
-)
-
-# 4. 結果表示
-for result in results:
-    print(f"{result.stage_name}: cost={result.cost:.6f}")
-
-# 5. 不確かさ評価（オプション）
-from robot_calibration.estimation.uncertainty import laplace_uncertainty
-from scipy.optimize import least_squares
-
-# 最終ステージのヤコビアンから不確かさを計算
-def fun(x):
-    from robot_calibration.models.residuals import compute_residuals
-    free_idx = ps.free_indices()
-    return compute_residuals(x, free_idx, ps, DH_NOMINAL, param_lookup, q_traj, p_exp)
-
-res = least_squares(fun, ps.get_vector(ps.free_indices()))
-uncertainty = laplace_uncertainty(res.jac, [p.name for p in ps.params if not p.fixed], res.x)
-print(uncertainty.summary())
-```
-
-### データフォーマット
-
-#### 関節角度軌道 (joint_trajectory.csv)
-```csv
-t,q0,q1,q2,q3,q4,q5
-0.0,0.1,0.2,0.3,0.4,0.5,0.6
-0.01,0.11,0.21,0.31,0.41,0.51,0.61
-...
-```
-
-#### 位置観測 (position_observations.csv)
-```csv
-t,px,py,pz
-0.0,0.1,0.2,0.3
-0.01,0.11,0.21,0.31
-...
-```
-
-### パラメータグループ
-
-- `kinematic`: DHパラメータ誤差 (α, a, d, θ_offset)
-- `tool`: ツール変換誤差 (tx, ty, tz, rx, ry, rz)
-- `local`: ベース座標系誤差 (tx, ty, tz, rx, ry, rz)
-- `time_offset`: 時刻ずれ
-- `joint_transmission_error`: 関節伝達誤差 (振幅・位相)
-
-### 観測変換
-
-- `IdentityTransform`: 位置残差を直接使用
-- `VelocityNormTransform`: 速度ノルムの時系列に変換（時刻ずれ推定に有効）
-- `FFTAmplitudeTransform`: 残差ノルムのFFT周波数成分（周期的誤差推定に有効）
-
-### 高度な使い方
-
-#### カスタムステージ定義
-
-```python
-from robot_calibration.estimation.optimizer import Stage
-from robot_calibration.models.transforms import VelocityNormTransform, IdentityTransform
-
-stages = [
-    Stage("time_offset", ["time_offset"], VelocityNormTransform(dt=0.01)),
-    Stage("kinematics", ["kinematic", "tool", "local"], IdentityTransform()),
+# 2. 推定パラメータ定義
+PARAMETERS = [
+    *[Parameter(f"d_alpha_{i}", value=0.0, group="kinematic", prior_std=np.pi) for i in range(6)],
+    *[Parameter(f"d_a_{i}",     value=0.0, group="kinematic", prior_std=1.0)   for i in range(6)],
+    *[Parameter(f"d_d_{i}",     value=0.0, group="kinematic", prior_std=1.0)   for i in range(6)],
+    *[Parameter(f"d_theta_offset_{i}", value=0.0, group="kinematic", prior_std=np.pi) for i in range(6)],
+    Parameter("tool_tx", value=0.0, group="tool",  prior_std=1.0),
+    Parameter("tool_ty", value=0.0, group="tool",  prior_std=1.0),
+    Parameter("tool_tz", value=0.0, group="tool",  prior_std=1.0),
+    Parameter("tool_rx", value=0.0, group="tool",  prior_std=np.pi),
+    Parameter("tool_ry", value=0.0, group="tool",  prior_std=np.pi),
+    Parameter("tool_rz", value=0.0, group="tool",  prior_std=np.pi, fixed=True),  # 縮退 → 固定
+    Parameter("local_tx", value=0.0, group="local", prior_std=1.0),
+    Parameter("local_ty", value=0.0, group="local", prior_std=1.0),
+    Parameter("local_tz", value=0.0, group="local", prior_std=1.0),
+    Parameter("local_rx", value=0.0, group="local", prior_std=np.pi),
+    Parameter("local_ry", value=0.0, group="local", prior_std=np.pi),
+    Parameter("local_rz", value=0.0, group="local", prior_std=np.pi),
 ]
+
+# 3. データ読み込み
+q_times, q_traj = load_joint_trajectory("joint_angles.csv")      # (N,), (N, 6)
+_,       y_exp  = load_position_observations("tcp_positions.csv") # (N,), (N, 3)
+
+# 4. 推定実行
+STAGES = [Stage("calib", param_groups=["kinematic","tool","local"], transform=IdentityTransform())]
+params_result, stage_results = run_calibration(
+    q_traj=q_traj, y_exp=y_exp,
+    parameters=PARAMETERS, kinematic_model=KIN, observation_model=OBS,
+    stages=STAGES,
+)
+print(params_result.summary())
+
+# 5. 不確かさ評価（ラプラス近似）
+uncertainty = compute_uncertainty(
+    params=params_result, kin_model=KIN, obs_model=OBS,
+    q_traj=q_traj, y_exp=y_exp,
+)
+print(uncertainty.summary())   # 各パラメータの推定値 ± 1σ
+
+# 6. Before/After サマリーグラフ出力
+calib_dict   = {p.name: p.value for p in params_result.params}
+nominal_dict = {p.name: 0.0     for p in params_result.params}
+p_before = np.array([OBS.predict(KIN.forward(q_traj[i], nominal_dict), {}) for i in range(len(q_traj))])
+p_after  = np.array([OBS.predict(KIN.forward(q_traj[i], calib_dict),   {}) for i in range(len(q_traj))])
+
+fig = plot_calibration_summary(
+    p_exp=y_exp, p_pred_before=p_before, p_pred_after=p_after,
+    uncertainty=uncertainty,
+)
+fig.savefig("output/summary.png", dpi=150)
 ```
 
-#### パラメータの固定/解放
+---
+
+## サンプルレシピ
+
+| ファイル | 内容 | 主な特徴 |
+|---|---|---|
+| [recipe_ur5_calibration.py](recipe_ur5_calibration.py) | ランダム姿勢 100 点からの DH / ツール / ベース誤差同定 | 基本ワークフロー・ラプラス近似 |
+| [recipe_straight_line_calib.py](recipe_straight_line_calib.py) | 直線軌道（500 Hz 高レート）+ 時刻ずれ同定 | 時刻ずれ推定・2 ステージ |
+| [recipe_ballbar.py](recipe_ballbar.py) | ボールバー距離計測（スカラー観測）による同定 | `DistanceObservation`・識別可能性の可視化 |
+| [recipe_transmission_error.py](recipe_transmission_error.py) | 関節伝達誤差を含む段階的キャリブレーション | カスタム `KinematicModel` サブクラス |
+
+```bash
+python recipe_ur5_calibration.py
+python recipe_straight_line_calib.py
+python recipe_ballbar.py
+python recipe_transmission_error.py
+```
+
+いずれも `output/` ディレクトリに Before/After サマリーグラフを保存します。
+
+---
+
+## `run_calibration` API
 
 ```python
-ps = make_default_parameter_set(DH_NOMINAL)
-# 特定のツールパラメータを固定
-ps.params[param_lookup["tool_tx"]].fixed = True
-ps.params[param_lookup["tool_ty"]].fixed = True
+params_result, stage_results = run_calibration(
+    q_traj            : np.ndarray,                # (N, n_joints) 関節角度 [rad]
+    y_exp             : np.ndarray,                # (N, obs_dim) または (N*obs_dim,) 観測値
+    parameters        : list[Parameter],           # 推定パラメータリスト
+    kinematic_model   : KinematicModel,            # 順運動学モデル
+    observation_model : ObservationModel,          # 観測モデル
+    stages            : list[Stage],               # 推定ステージリスト
+    ls_kwargs         : dict | None = None,        # scipy.optimize.least_squares への追加引数
+    q_timestamps      : np.ndarray | None = None,  # タイムスタンプ (N,) — time_offset 推定時に必要
+    final_full_tune   : bool = False,              # 全ステージ後に全パラメータで最終調整
+) -> tuple[ParameterSet, list[StageResult]]
 ```
+
+## `compute_uncertainty` API
+
+```python
+uncertainty = compute_uncertainty(
+    params            : ParameterSet,              # run_calibration の戻り値
+    kin_model         : KinematicModel,
+    obs_model         : ObservationModel,
+    q_traj            : np.ndarray,
+    y_exp             : np.ndarray,
+    transform         : ObservationTransform | None = None,  # 省略時 IdentityTransform
+    q_timestamps      : np.ndarray | None = None,
+) -> UncertaintyResult   # .param_names, .means, .stds, .cov
+```
+
+ヤコビアン `J` を最適解で評価し、`Cov ≈ (J^T J)^{-1}` からパラメータ標準偏差を計算します。  
+`σ` が大きいパラメータは軌道から同定しにくい（情報不足・縮退に近い）ことを意味します。
+
+---
+
+## パラメータ定義
+
+```python
+Parameter(
+    name      : str,          # DHKinematics が認識するキー名と対応
+    value     : float,        # 初期値
+    group     : str,          # "kinematic" | "tool" | "local" | "time_offset" | 任意
+    prior_std : float,        # 事前分布の標準偏差（大きいほど非情報的）
+    fixed     : bool = False, # True にすると推定から除外
+)
+```
+
+### DHKinematics が認識するパラメータ名
+
+| グループ | パラメータ名 | 意味 |
+|---|---|---|
+| `kinematic` | `d_alpha_i`, `d_a_i`, `d_d_i`, `d_theta_offset_i` | DH パラメータ誤差（i=0..n-1） |
+| `tool` | `tool_tx/ty/tz` [m], `tool_rx/ry/rz` [rad] | ツール変換誤差 |
+| `local` | `local_tx/ty/tz` [m], `local_rx/ry/rz` [rad] | ベース座標系誤差 |
+| `time_offset` | `time_offset` [s] | 制御と観測の時刻ずれ |
+
+### 縮退パラメータの扱い
+
+位置のみ観測の場合、`tool_rz` と `d_theta_offset_5`（最終軸まわり回転）は完全縮退で分離不能です。  
+慣例として `tool_rz` を `fixed=True` に設定し、効果を `d_theta_offset_5` に吸収させます。
+
+---
+
+## 時刻ずれ推定（`time_offset`）
+
+ロボットコントローラと外部計測器のクロックずれを同定します。  
+`q_timestamps` を `run_calibration` に渡すと、パイプライン内で cubic 補間を使い  
+`q_eff(t) = q(t + time_offset)` として FK を評価します。
+
+```python
+# パラメータに time_offset を追加
+PARAMETERS += [Parameter("time_offset", value=0.0, group="time_offset", prior_std=1.0)]
+
+# 2 ステージ推定（先に time_offset、次に DH 誤差）
+STAGES = [
+    Stage("stage1_time_offset",
+          param_groups=["time_offset"],
+          transform=IdentityTransform()),   # 位置残差は time_offset に対して単調 → 確実に収束
+    Stage("stage2_kinematics",
+          param_groups=["kinematic", "tool", "local"],
+          transform=IdentityTransform()),
+]
+
+params_result, _ = run_calibration(
+    ..., stages=STAGES, q_timestamps=q_timestamps,
+)
+```
+
+> **注意**: `q_timestamps` に渡す関節角度時系列は **C1 連続**（速度連続）である必要があります。  
+> ライン間に不連続な停止区間を挿入すると cubic 補間がスパイクを生じます。  
+> ライン間は smooth-step 関数などで関節空間ブレンドしてください（[recipe_straight_line_calib.py](recipe_straight_line_calib.py) 参照）。
+
+---
+
+## ボールバー（距離計測）による識別可能性評価
+
+`DistanceObservation` を使うと、固定点からの距離スカラー（1 次元）のみで同定を行えます。
+
+```python
+from robot_calibration import DistanceObservation
+
+ORIGIN = np.array([0.50, 0.00, 0.30])   # ボールバー固定端 [m]
+OBS    = DistanceObservation(origin=ORIGIN)
+
+# y_exp は (N, 1) または (N,) の距離配列 [m]
+y_exp = np.array([OBS.predict(KIN.forward(q, TRUE_ERRORS), {})[0] for q in q_traj])
+```
+
+Laplace 近似の `σ` を観察することで、**スカラー距離測定では同定困難なパラメータ**（σ が大きい）が一目でわかります。  
+複数の固定点（マルチオリジン）を用いると識別性が向上します（参考: [recipe_ballbar.py](recipe_ballbar.py)）。
+
+| 典型的な観測 | 識別しやすい誤差 | 識別しにくい誤差 |
+|---|---|---|
+| 3D 位置（`PoseObservation`） | すべての DH / ツール / ベース誤差 | 最終軸回転（tool_rz ↔ d_theta_offset_5） |
+| 距離スカラー（`DistanceObservation`） | 平行移動誤差、arm length 誤差 | 視線方向に直交する回転誤差、後段の軸誤差 |
+
+---
+
+## 関節伝達誤差モデル
+
+ギアの周期的誤差などを模擬する伝達誤差モデルは、`DHKinematics` をサブクラス化して実装します。
+
+### フーリエ係数形式（推奨）
+
+`amp * sin(q + phase)` の直接パラメータ化は `amp=0` 付近で `phase` の勾配がゼロになり、  
+LM 最適化が停留します。代わりに **フーリエ係数 (a, b)** で線形パラメータ化します。
+
+```python
+class DHKinematicsWithTransmissionError(DHKinematics):
+    """
+    q_actual[i] = q[i] + a_i * cos(q[i]) + b_i * sin(q[i])
+    (a = amp*sin(phase),  b = amp*cos(phase))
+    """
+    def forward(self, q: np.ndarray, params: dict) -> np.ndarray:
+        q_eff = q.copy()
+        for i in range(len(q)):
+            a = params.get(f"trans_err_a_{i}", 0.0)
+            b = params.get(f"trans_err_b_{i}", 0.0)
+            q_eff[i] += a * np.cos(q[i]) + b * np.sin(q[i])
+        return super().forward(q_eff, params)
+
+# 各関節に (a, b) パラメータを追加
+PARAMETERS += [
+    Parameter("trans_err_a_0", value=0.0, group="transmission_0", prior_std=0.1),
+    Parameter("trans_err_b_0", value=0.0, group="transmission_0", prior_std=0.1),
+]
+
+# 推定後に amp/phase に変換
+est_amp   = np.sqrt(est_a**2 + est_b**2)
+est_phase = np.arctan2(est_a, est_b)
+```
+
+### 段階的推定パターン
+
+```python
+STAGES = [
+    # 1. DH 誤差を先行推定（伝達誤差との相関を低減）
+    Stage("kinematics", param_groups=["kinematic", "tool", "local"], ...),
+    # 2. 各軸の掃引データで伝達誤差を識別
+    Stage("transmission_0", param_groups=["transmission_0"], ...),
+    Stage("transmission_2", param_groups=["transmission_2"], ...),
+]
+
+params_result, _ = run_calibration(
+    ..., stages=STAGES,
+    final_full_tune=True,   # 全パラメータを同時最終調整
+)
+```
+
+> 各軸の掃引データ（関節 i だけ動かし他を固定）と  
+> ランダム姿勢データを結合することで、伝達誤差と DH 誤差を分離しやすくなります。  
+> 実例は [recipe_transmission_error.py](recipe_transmission_error.py) を参照。
+
+---
+
+## 推定ステージ定義
+
+```python
+from robot_calibration import Stage
+from robot_calibration.models.transforms import IdentityTransform
+
+Stage(
+    name         : str,              # ステージ名（ログ表示用）
+    param_groups : list[str] | None, # 推定対象グループ（None = 全パラメータ）
+    transform    : ObservationTransform,
+)
+```
+
+---
+
+## 観測変換
+
+| クラス | 用途 |
+|---|---|
+| `IdentityTransform` | 位置残差を直接使用（汎用・`time_offset` 推定にも適用可） |
+| `VelocityNormTransform(dt)` | 速度ノルム時系列に変換。単純な 1 軸回転運動での `time_offset` 推定に有効 |
+| `FFTAmplitudeTransform` | 残差ノルムの FFT 振幅。周期的伝達誤差推定に有効 |
+
+> `IdentityTransform` は位置残差の勾配が `time_offset` に対して単調なため、  
+> 多関節 3D 軌道での `time_offset` 推定に最も安定して収束します。
+
+---
+
+## Before/After 可視化
+
+```python
+from robot_calibration.visualization.plotter import plot_calibration_summary
+
+fig = plot_calibration_summary(
+    p_exp          : np.ndarray,              # 観測位置 (N, 3) [m]
+    p_pred_before  : np.ndarray,              # キャリブ前予測 (N, 3) [m]
+    p_pred_after   : np.ndarray,              # キャリブ後予測 (N, 3) [m]
+    uncertainty    : UncertaintyResult | None = None,  # compute_uncertainty() の戻り値
+    true_errors    : dict[str, float] | None = None,   # シミュレーション時の真値
+    title          : str = "Calibration Summary",
+) -> matplotlib.figure.Figure
+```
+
+生成されるグラフ（3 段構成）:
+
+| 段 | 内容 |
+|---|---|
+| 上段 | XYZ 各軸の残差時系列（Before/After 重ね描き） + XY 誤差散布図 |
+| 中段 | 点ごとの誤差ノルム時系列 + RMS 改善率棒グラフ |
+| 下段 | パラメータ推定値 ± 1σ（真値がある場合は × で重ねて表示） |
+
+スカラー距離観測（ボールバー等）には `_plot_ballbar_summary`（[recipe_ballbar.py](recipe_ballbar.py) 内に定義）を使います。  
+同関数は対数スケールの σ バーで識別可能性を可視化します。
+
+---
+
+## カスタムモデルの実装
+
+`DHKinematics` や `PoseObservation` では対応できない場合はサブクラス化します。
+
+```python
+from robot_calibration import KinematicModel, ObservationModel
+import numpy as np
+
+class MyKinematics(KinematicModel):
+    def forward(self, q: np.ndarray, params: dict) -> np.ndarray:
+        # params は {名前: 値} の辞書。未定義キーは .get(key, 0.0) で取る
+        return T   # (4, 4) SE(3)
+
+    def jacobian(self, q: np.ndarray, params: dict) -> np.ndarray:
+        return self.numerical_jacobian(q, params)  # 解析解がなければ数値微分を使用
+
+class MyObservation(ObservationModel):
+    def predict(self, x: np.ndarray, params: dict) -> np.ndarray:
+        return x[:3, 3]   # 例: 3D 位置。(k,) を返せば k 次元観測として自動処理
+```
+
+`KinematicModel` には `numerical_jacobian()` が実装済みで、解析的ヤコビアンの検証に使えます。  
+`ObservationModel.predict()` が返すベクトルの長さは任意（3D 位置なら `(3,)`、距離なら `(1,)`、K 点距離なら `(K,)` など）。
+
+---
+
+## データフォーマット
+
+### 関節角度軌道 (`joint_angles.csv`)
+
+```
+t,q0,q1,q2,q3,q4,q5
+0.000,0.1,0.2,0.3,0.4,0.5,0.6
+0.002,0.11,0.21,0.31,0.41,0.51,0.61
+```
+
+### TCP 位置観測 (`tcp_positions.csv`)
+
+```
+t,px,py,pz
+0.000,0.412,0.031,0.553
+0.002,0.413,0.031,0.554
+```
+
+```python
+from robot_calibration.io.loader import load_joint_trajectory, load_position_observations
+
+q_times, q_traj = load_joint_trajectory("joint_angles.csv")      # → (N,), (N, 6)
+_,       y_exp  = load_position_observations("tcp_positions.csv") # → (N,), (N, 3)
+```
+
+---
 
 ## テスト実行
 
@@ -143,35 +428,33 @@ ps.params[param_lookup["tool_ty"]].fixed = True
 python -m robot_calibration.tests.simulation_test
 ```
 
-テストでは以下の検証を行います：
-- ヤコビアンの解析解と数値微分の一致
-- 観測変換のヤコビアン検証
-- DHパラメータヤコビアン検証
-- 伝達誤差同定
-- 軌道データからの同定
-- 直線軌道データからの同定
+| テスト名 | 内容 |
+|---|---|
+| ヤコビアン検証 | 解析的ヤコビアンと数値微分の一致確認 |
+| DH ヤコビアン検証 | DH パラメータ誤差ヤコビアンの確認 |
+| 伝達誤差同定 | 周期的関節誤差の同定 |
+| `test_trajectory_identification` | 6 関節サイン波軌道 + 時刻ずれ同定（20 ms 精度 < 5 ms） |
+| `test_straight_line_identification` | 直線軌道 9 本から DH / ツール / ベース誤差同定 |
 
-テスト成功時は `output/` ディレクトリにプロット画像が保存されます。
+テスト成功時、プロット画像が `robot_calibration/tests/output/` に保存されます。
+
+---
 
 ## API リファレンス
 
-### 主要クラス
+### `robot_calibration` トップレベルエクスポート
 
-- `RobotKinematics`: DHパラメータによる順運動学
-- `ParameterSet`: 推定パラメータ管理
-- `ObservationTransform`: 観測データの変換
-- `Stage`: 最適化ステージ定義
-
-### 主要関数
-
-- `run_staged_optimization()`: 段階的最適化実行
-- `laplace_uncertainty()`: 不確かさ評価
-- `load_joint_trajectory()` / `load_position_observations()`: データ読み込み
-
-## ライセンス
-
-このプロジェクトはオープンソースです。適切なライセンスを追加してください。
-
-## 貢献
-
-バグ報告や機能リクエストはGitHub Issuesでお願いします。
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| `run_calibration` | 関数 | 統合キャリブレーションパイプライン |
+| `compute_uncertainty` | 関数 | ラプラス近似による不確かさ評価 |
+| `KinematicModel` | ABC | 順運動学モデルのインタフェース |
+| `ObservationModel` | ABC | 観測モデルのインタフェース |
+| `DHKinematics` | クラス | Modified DH パラメータによる順運動学 |
+| `PoseObservation` | クラス | 3D 位置観測モデル |
+| `DistanceObservation` | クラス | 固定点からの距離スカラー観測モデル |
+| `Parameter` | クラス | 推定パラメータ（name, value, group, prior_std, fixed） |
+| `ParameterSet` | クラス | パラメータコレクション（`.summary()`, `.free_indices()` など） |
+| `Stage` | クラス | 推定ステージ定義（name, param_groups, transform） |
+| `StageResult` | クラス | ステージ結果（cost, success, message, jacobian） |
+| `UncertaintyResult` | クラス | 不確かさ評価結果（param_names, means, stds, cov） |
