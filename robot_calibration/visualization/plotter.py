@@ -2,16 +2,28 @@
 残差・収束・パラメータ結果の描画。
 """
 
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from ..estimation.uncertainty import UncertaintyResult
 
 
+def _save(fig: plt.Figure, save_path, dpi: int = 150) -> None:
+    """save_path が指定されていれば保存して閉じる。"""
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=dpi)
+        plt.close(fig)
+
+
 def plot_residuals(
     r_before: np.ndarray,
     r_after: np.ndarray,
     title: str = "Residuals before/after calibration",
+    save_path=None,
 ) -> plt.Figure:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     for ax, r, label in zip(axes, [r_before, r_after], ["Before", "After"]):
@@ -22,12 +34,14 @@ def plot_residuals(
         ax.grid(True)
     fig.suptitle(title)
     plt.tight_layout()
+    _save(fig, save_path)
     return fig
 
 
 def plot_parameter_comparison(
     true_values: dict[str, float],
     estimated: UncertaintyResult,
+    save_path=None,
 ) -> plt.Figure:
     """真値と推定値を比較するバープロット。シミュレーションテスト用。"""
     names = estimated.param_names
@@ -45,6 +59,7 @@ def plot_parameter_comparison(
     ax.set_title("True vs Estimated parameters")
     ax.legend()
     plt.tight_layout()
+    _save(fig, save_path)
     return fig
 
 
@@ -52,6 +67,7 @@ def plot_trajectory_comparison(
     p_exp: np.ndarray,
     p_pred_before: np.ndarray,
     p_pred_after: np.ndarray,
+    save_path=None,
 ) -> plt.Figure:
     """観測軌道と予測軌道の比較（3D + 残差ノルム）。"""
     fig = plt.figure(figsize=(14, 5))
@@ -75,6 +91,7 @@ def plot_trajectory_comparison(
         ax.grid(True)
 
     plt.tight_layout()
+    _save(fig, save_path)
     return fig
 
 
@@ -85,6 +102,7 @@ def plot_calibration_summary(
     uncertainty: UncertaintyResult | None = None,
     true_errors: dict[str, float] | None = None,
     title: str = "Calibration Summary",
+    save_path=None,
 ) -> plt.Figure:
     """
     Before/After を一枚にまとめたサマリーグラフ。
@@ -183,4 +201,101 @@ def plot_calibration_summary(
         ax_p.legend()
         ax_p.grid(True, axis="y", alpha=0.4)
 
+    _save(fig, save_path)
+    return fig
+
+
+def plot_sequential_convergence(
+    steps: list,
+    param_filter: list[str] | None = None,
+    true_values: dict[str, float] | None = None,
+    rms_scale: float = 1e3,
+    rms_unit: str = "mm",
+    n_cols: int = 3,
+    title: str = "Sequential Estimation Convergence",
+    save_path=None,
+) -> plt.Figure:
+    """
+    逐次推定（run_sequential_calibration）の収束プロット。
+
+    Parameters
+    ----------
+    steps        : run_sequential_calibration の戻り値
+    param_filter : 表示するパラメータ名のリスト。None のとき全 free パラメータを表示。
+    true_values  : 真値辞書（シミュレーション時に重ねて表示）
+    rms_scale    : 残差 RMS に掛けるスケール係数（デフォルト 1e3 → mm）
+    rms_unit     : RMS 軸のラベル単位
+    save_path    : 保存先パス（str / Path）。指定時は保存して図を閉じる。None のとき保存しない。
+    n_cols       : パラメータサブプロットの列数
+    title        : 図タイトル
+
+    Layout
+    ------
+    最上段: 残差 RMS vs データ数
+    残り  : パラメータ推定値 ± 1σ vs データ数（n_cols 列のグリッド）
+    """
+    if not steps:
+        raise ValueError("steps が空です。")
+
+    all_names = steps[0].param_names
+    names = param_filter if param_filter is not None else all_names
+    names = [n for n in names if n in all_names]
+    if not names:
+        raise ValueError(f"param_filter に該当するパラメータがありません: {param_filter}")
+
+    n_data_arr = np.array([s.n_data for s in steps])
+    name_to_idx = {n: i for i, n in enumerate(all_names)}
+    sel_idx = [name_to_idx[n] for n in names]
+
+    vals = np.array([s.param_values[sel_idx] for s in steps])   # (G, P)
+    stds = np.array([s.param_stds[sel_idx]   for s in steps])   # (G, P)
+    rmss = np.array([s.residual_rms           for s in steps]) * rms_scale
+
+    n_params = len(names)
+    n_rows_params = (n_params + n_cols - 1) // n_cols
+    n_rows_total  = 1 + n_rows_params
+
+    fig = plt.figure(
+        figsize=(5 * n_cols, 3 + 3 * n_rows_params),
+        constrained_layout=True,
+    )
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    gs = gridspec.GridSpec(n_rows_total, n_cols, figure=fig)
+
+    color_val  = "#4C9BE8"
+    color_band = "#AED4F5"
+    color_true = "#E07B54"
+
+    # ── 最上段: 残差 RMS ──────────────────────────────────────────────────────
+    ax_rms = fig.add_subplot(gs[0, :])
+    ax_rms.plot(n_data_arr, rmss, "o-", color=color_val, lw=1.5, ms=4)
+    ax_rms.set_xlabel("data count")
+    ax_rms.set_ylabel(f"RMS [{rms_unit}]")
+    ax_rms.set_title("Residual RMS vs data count")
+    ax_rms.grid(True, alpha=0.4)
+    ax_rms.set_xlim(left=0)
+
+    # ── パラメータグリッド ────────────────────────────────────────────────────
+    for pi, name in enumerate(names):
+        row = 1 + pi // n_cols
+        col = pi % n_cols
+        ax = fig.add_subplot(gs[row, col])
+
+        v = vals[:, pi]
+        s = stds[:, pi]
+
+        ax.fill_between(n_data_arr, v - s, v + s, alpha=0.3, color=color_band, label="±1σ")
+        ax.plot(n_data_arr, v, "o-", color=color_val, lw=1.5, ms=3, label="estimate")
+
+        if true_values is not None and name in true_values:
+            ax.axhline(true_values[name], color=color_true, lw=1.2, ls="--", label="true")
+
+        ax.set_title(name, fontsize=8)
+        ax.set_xlabel("data count", fontsize=7)
+        ax.set_xlim(left=0)
+        ax.grid(True, alpha=0.4)
+        if pi == 0:
+            ax.legend(fontsize=6)
+
+    _save(fig, save_path)
     return fig

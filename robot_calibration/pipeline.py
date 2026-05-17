@@ -8,7 +8,9 @@
 レシピ側のクラス名・内部構造には一切依存しない。
 """
 
+import copy
 import numpy as np
+from dataclasses import dataclass
 from scipy.optimize import least_squares
 from scipy.interpolate import interp1d
 
@@ -18,6 +20,17 @@ from .models.base import ObservationTransform
 from .models.matrix import IdentityTransform
 from .estimation.optimizer import Stage, StageResult
 from .estimation.uncertainty import laplace_uncertainty, UncertaintyResult
+
+
+@dataclass
+class SequentialStep:
+    """run_sequential_calibration の1ステップの結果。"""
+    n_data: int                  # このステップで使ったデータ点数
+    group_idx: int               # グループ番号（0始まり）
+    param_names: list[str]       # free パラメータ名（固定パラメータは含まない）
+    param_values: np.ndarray     # 推定値
+    param_stds: np.ndarray       # Laplace 近似による 1σ 不確かさ
+    residual_rms: float          # 観測残差の RMS（観測値と同じ単位）
 
 
 def _params_to_dict(ps: ParameterSet) -> dict:
@@ -214,3 +227,97 @@ def compute_uncertainty(
 
     free_names = [params.params[i].name for i in free_idx]
     return laplace_uncertainty(res.jac, free_names, x0)
+
+
+def run_sequential_calibration(
+    q_traj: np.ndarray,
+    y_exp: np.ndarray,
+    parameters: list[Parameter],
+    kinematic_model: KinematicModel,
+    observation_model: ObservationModel,
+    stages: list[Stage],
+    n_groups: int = 10,
+    ls_kwargs: dict = None,
+    q_timestamps: np.ndarray | None = None,
+    update_prior: bool = True,
+) -> list[SequentialStep]:
+    """
+    データを n_groups に分割し、累積データ量を増やしながら逐次推定する。
+
+    Parameters
+    ----------
+    n_groups     : 分割数。各ステップで使うデータ数は N/n_groups ずつ増える。
+    update_prior : True（デフォルト）のとき、前ステップの事後分布を次の事前分布に設定
+                   する（逐次ベイズ推定）。False のとき毎ステップ独立推定（収束比較用）。
+
+    戻り値
+    ------
+    list[SequentialStep]  n_groups 個。各要素に推定値・不確かさ・RMS を含む。
+
+    使い方
+    ------
+    steps = run_sequential_calibration(...)
+    fig   = plot_sequential_convergence(steps, param_filter=["d_a_0", "d_a_1"])
+    """
+    N = len(q_traj)
+    y_flat_all = np.asarray(y_exp).flatten()
+    obs_dim = len(y_flat_all) // N
+
+    # 各ステップのデータ終端インデックス（等間隔、最後は端まで）
+    edges = np.round(np.linspace(0, N, n_groups + 1)).astype(int)
+
+    # warm-start 用パラメータ（ステップをまたいで値・事前分布を更新する）
+    working_params = copy.deepcopy(parameters)
+    steps: list[SequentialStep] = []
+
+    for g in range(n_groups):
+        n_data = int(edges[g + 1])
+
+        q_sub = q_traj[:n_data]
+        y_sub = y_flat_all[:n_data * obs_dim]
+        ts_sub = q_timestamps[:n_data] if q_timestamps is not None else None
+
+        # 最適化（working_params の value が warm-start 初期値になる）
+        params_g, _ = run_calibration(
+            q_sub, y_sub, working_params,
+            kinematic_model, observation_model, stages,
+            ls_kwargs=ls_kwargs, q_timestamps=ts_sub,
+        )
+
+        # 不確かさ（Laplace 近似）
+        unc = compute_uncertainty(
+            params_g, kinematic_model, observation_model,
+            q_sub, y_sub, q_timestamps=ts_sub,
+        )
+
+        # 残差 RMS（time_offset 補間なしの単純予測で十分）
+        pdict = _params_to_dict(params_g)
+        poses = kinematic_model.forward_batch(q_sub, pdict)
+        y_pred = observation_model.predict_batch(poses, pdict)
+        rms = float(np.sqrt(np.mean((y_sub - y_pred) ** 2)))
+
+        steps.append(SequentialStep(
+            n_data=n_data,
+            group_idx=g,
+            param_names=unc.param_names,
+            param_values=unc.means.copy(),
+            param_stds=unc.stds.copy(),
+            residual_rms=rms,
+        ))
+
+        if update_prior:
+            # 事後分布 → 次ステップの事前分布（逐次ベイズ更新）
+            val_map = dict(zip(unc.param_names, unc.means))
+            std_map = dict(zip(unc.param_names, unc.stds))
+            for p in params_g.params:
+                if p.name in val_map:
+                    p.prior_mean = val_map[p.name]
+                    p.prior_std  = max(std_map[p.name], 1e-9)
+
+        # working_params を次ステップの warm-start として引き継ぐ
+        # （params_g.params は working_params と同一オブジェクトなので代入不要）
+        working_params = params_g.params
+
+        print(f"[group {g+1}/{n_groups}]  n={n_data:5d}  RMS={rms*1e3:.3f} mm")
+
+    return steps
