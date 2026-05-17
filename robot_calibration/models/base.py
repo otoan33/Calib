@@ -10,6 +10,27 @@ import numpy as np
 from abc import ABC, abstractmethod
 
 
+class ObservationTransform(ABC):
+    """
+    観測変換 T(y)。変換を適用することで特定パラメータへの感度を分離する。
+
+    残差の計算方式が2種類ある（transform_mode 属性で区別）：
+      "split"   : r = T(y_exp) - T(y_pred)   ← Identity, VelocityNorm
+      "residual": r = T(y_exp - y_pred)       ← FFTAmplitude
+    """
+
+    # "split" or "residual"
+    transform_mode: str = "split"
+
+    @abstractmethod
+    def apply(self, y: np.ndarray) -> np.ndarray:
+        """y を変換して返す。"""
+
+    @abstractmethod
+    def jacobian(self, y: np.ndarray) -> np.ndarray:
+        """∂apply/∂y を返す。形状は (len(apply(y)), len(y))。"""
+
+
 class KinematicModel(ABC):
     """
     順運動学モデルのインタフェース。

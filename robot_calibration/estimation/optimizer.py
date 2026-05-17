@@ -6,9 +6,80 @@ import numpy as np
 from dataclasses import dataclass, field
 from scipy.optimize import least_squares
 
+import numpy as np
 from ..models.parameters import ParameterSet
-from ..models.transforms import ObservationTransform, IdentityTransform
-from ..models.residuals import compute_residuals
+from ..models.base import ObservationTransform
+from ..models.matrix import IdentityTransform
+from ..models.kinematics import build_kinematic_from_params, apply_transmission_error
+from ..models.observation import vec6_to_se3
+
+
+def compute_residuals(
+    x: np.ndarray,
+    free_indices: list[int],
+    params: ParameterSet,
+    dh_nominal: list[dict],
+    param_lookup: dict,
+    q_traj: np.ndarray,
+    p_exp: np.ndarray,
+    transform: ObservationTransform,
+    include_prior: bool = True,
+    q_timestamps: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    残差ベクトルを返す。scipy.optimize.least_squares の fun 引数として使用。
+
+    "split"   : r = T(y_exp) - T(y_pred)
+    "residual": r = T(||p_exp - p_pred||)
+    """
+    params.set_vector(free_indices, x)
+
+    kin = build_kinematic_from_params(dh_nominal, params, param_lookup)
+    T_tool  = vec6_to_se3(np.array([
+        params.params[param_lookup[k]].value
+        for k in ["tool_tx","tool_ty","tool_tz","tool_rx","tool_ry","tool_rz"]
+    ]))
+    T_local = vec6_to_se3(np.array([
+        params.params[param_lookup[k]].value
+        for k in ["local_tx","local_ty","local_tz","local_rx","local_ry","local_rz"]
+    ]))
+    n_joints = len(dh_nominal)
+
+    if q_timestamps is not None and "time_offset" in param_lookup:
+        from scipy.interpolate import interp1d as _interp
+        dt_offset = params.params[param_lookup["time_offset"]].value
+        t_shifted = q_timestamps + dt_offset
+        q_traj_eff = np.column_stack([
+            _interp(
+                q_timestamps, q_traj[:, j], kind="cubic",
+                bounds_error=False,
+                fill_value=(q_traj[0, j], q_traj[-1, j]),
+            )(t_shifted)
+            for j in range(q_traj.shape[1])
+        ])
+    else:
+        q_traj_eff = q_traj
+
+    N = len(q_traj_eff)
+    p_pred = np.zeros((N, 3))
+    for t in range(N):
+        q_eff = apply_transmission_error(q_traj_eff[t], params, param_lookup, n_joints)
+        T = kin.forward(q_eff, T_tool, T_local)
+        p_pred[t] = T[:3, 3]
+
+    if getattr(transform, "transform_mode", "split") == "residual":
+        r_norm = np.linalg.norm(p_exp - p_pred, axis=1)
+        r_obs = transform.apply(r_norm)
+    else:
+        y_exp_flat  = p_exp.flatten()
+        y_pred_flat = p_pred.flatten()
+        r_obs = transform.apply(y_exp_flat) - transform.apply(y_pred_flat)
+
+    if not include_prior:
+        return r_obs
+
+    r_prior = params.get_prior_residuals(free_indices)
+    return np.concatenate([r_obs, r_prior])
 
 
 @dataclass
@@ -128,7 +199,7 @@ def default_stages(transforms_override: dict = None) -> list[Stage]:
 
     transforms_override: {"time_offset": MyTransform(), ...} で個別上書き可。
     """
-    from ..models.transforms import VelocityNormTransform, FFTAmplitudeTransform
+    from ..models.matrix import VelocityNormTransform, FFTAmplitudeTransform
 
     t = transforms_override or {}
 

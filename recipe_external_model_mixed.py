@@ -30,10 +30,9 @@ import numpy as np
 from pathlib import Path
 
 from robot_calibration.models.base import KinematicModel
-from robot_calibration.models.defaults import PoseObservation
+from robot_calibration.models.observation import PoseObservation, vec6_to_se3
 from robot_calibration.models.parameters import Parameter
-from robot_calibration.models.observation import vec6_to_se3
-from robot_calibration.models.transforms import IdentityTransform
+from robot_calibration.models.matrix import IdentityTransform
 from robot_calibration.estimation.optimizer import Stage
 from robot_calibration.pipeline import run_calibration, compute_uncertainty
 from robot_calibration.visualization.plotter import (

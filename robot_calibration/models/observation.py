@@ -7,8 +7,7 @@ y_pred(t) = T( g( f(θ, q(t + Δt)) ) )
 """
 
 import numpy as np
-from .kinematics import RobotKinematics, DHParams
-from .parameters import ParameterSet
+from .base import ObservationModel
 
 
 def pose_to_position(T: np.ndarray) -> np.ndarray:
@@ -57,42 +56,28 @@ def vec6_to_se3(v: np.ndarray) -> np.ndarray:
     return T
 
 
-class PositionObservationModel:
+class PoseObservation(ObservationModel):
     """
-    観測モデル：エンドエフェクタ位置を直接観測する場合。
+    手先の 3D 位置をそのまま観測値として返す。
 
-    g(T) = T[:3, 3]
+    最も基本的な観測モデル。レーザートラッカー・CMM など位置計測に対応。
+    戻り値: (3,) [x, y, z] [m]
     """
 
-    def predict(
-        self,
-        kin: RobotKinematics,
-        q: np.ndarray,
-        params: ParameterSet,
-        param_lookup: dict,
-    ) -> np.ndarray:
-        """
-        順運動学を解いてエンドエフェクタ位置を返す。
-
-        param_lookup: パラメータ名 → params.params インデックスのマップ
-        """
-        T_tool  = _build_tool_transform(params, param_lookup)
-        T_local = _build_local_transform(params, param_lookup)
-        T = kin.forward(q, T_tool, T_local)
-        return pose_to_position(T)
+    def predict(self, x: np.ndarray, params: dict) -> np.ndarray:
+        return x[:3, 3]
 
 
-def _build_tool_transform(params: ParameterSet, param_lookup: dict) -> np.ndarray:
-    v = np.array([
-        params.params[param_lookup[k]].value
-        for k in ["tool_tx", "tool_ty", "tool_tz", "tool_rx", "tool_ry", "tool_rz"]
-    ])
-    return vec6_to_se3(v)
+class DistanceObservation(ObservationModel):
+    """
+    固定点 origin から TCP までの距離スカラーを観測値として返す。
 
+    用途: 球形エラーメータ（レーザートラッカーのレトロリフレクタ固定点基準）など。
+    戻り値: (1,) [r] [m]
+    """
 
-def _build_local_transform(params: ParameterSet, param_lookup: dict) -> np.ndarray:
-    v = np.array([
-        params.params[param_lookup[k]].value
-        for k in ["local_tx", "local_ty", "local_tz", "local_rx", "local_ry", "local_rz"]
-    ])
-    return vec6_to_se3(v)
+    def __init__(self, origin: np.ndarray = None):
+        self.origin = np.zeros(3) if origin is None else np.asarray(origin, dtype=float)
+
+    def predict(self, x: np.ndarray, params: dict) -> np.ndarray:
+        return np.array([np.linalg.norm(x[:3, 3] - self.origin)])

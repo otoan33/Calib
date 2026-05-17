@@ -1,29 +1,13 @@
 """
-観測変換 T(y)。変換を適用することで特定パラメータへの感度を分離する。
+観測変換の具象実装。
 
-残差の計算方式が2種類ある（transform_mode 属性で区別）：
-  "split"   : r = T(y_exp) - T(y_pred)   ← Identity, VelocityNorm
-  "residual": r = T(y_exp - y_pred)       ← FFTAmplitude
-
-"split" は変換後の値を直接比較。
-"residual" は差分（生残差）を変換して周波数・速度等の特徴量に変換する。
+  IdentityTransform      — 変換なし
+  VelocityNormTransform  — 3D 軌道 → 速度ノルム時系列
+  FFTAmplitudeTransform  — 残差ノルム → 周波数振幅（伝達誤差同定用）
 """
 
 import numpy as np
-from abc import ABC, abstractmethod
-
-
-class ObservationTransform(ABC):
-    # "split" or "residual" — compute_residuals がこれを見て処理を切り替える
-    transform_mode: str = "split"
-
-    @abstractmethod
-    def apply(self, y: np.ndarray) -> np.ndarray:
-        """y を変換して返す。"""
-
-    @abstractmethod
-    def jacobian(self, y: np.ndarray) -> np.ndarray:
-        """∂apply/∂y を返す。形状は (len(apply(y)), len(y))。"""
+from .base import ObservationTransform
 
 
 class IdentityTransform(ObservationTransform):
@@ -87,23 +71,16 @@ class FFTAmplitudeTransform(ObservationTransform):
 
     用途：関節の角度伝達誤差（周期的誤差）のパラメータ推定。
 
-    transform_mode = "residual" のため compute_residuals は
+    transform_mode = "residual" のため pipeline は
         r_raw = p_exp - p_pred  (N, 3)
         s[t]  = ||r_raw[t]||   スカラー時系列 (N,)
         r     = |FFT(s)|       ← これをゼロに近づける
     という処理を行う。
-
-    周期的な伝達誤差があると s[t] に特定周波数の成分が現れ、
-    それを FFT で検出・同定できる。
     """
     transform_mode = "residual"
 
     def apply(self, y: np.ndarray) -> np.ndarray:
-        """
-        y : スカラー時系列 (N,) — 位置残差ノルムを想定
-
-        戻り値: 振幅スペクトル (N//2 + 1,)
-        """
+        """y : スカラー時系列 (N,)  →  振幅スペクトル (N//2 + 1,)"""
         N = len(y)
         Y = np.fft.rfft(y) / N
         return np.abs(Y)
@@ -113,8 +90,6 @@ class FFTAmplitudeTransform(ObservationTransform):
         |FFT(y)[k]| の y に対するヤコビアン。
 
         FFT(y)[k] = Σ_n y[n] exp(-2πi kn/N)
-        d|Z|/dZ_real = Z_real/|Z|, d|Z|/dZ_imag = Z_imag/|Z|
-
         連鎖律: ∂|Y_k|/∂y[n] = (Y_k.real * cos - Y_k.imag * sin) / (N * |Y_k|)
         """
         N = len(y)

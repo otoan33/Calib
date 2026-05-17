@@ -1,5 +1,5 @@
 """
-DHパラメータによる順運動学と解析的ヤコビアン。
+DHパラメータによる順運動学と解析的ヤコビアン。DHKinematics を含む。
 
 DH規約（Modified DH / Craig規約）:
   T_i = Rot_x(alpha_{i-1}) * Trans_x(a_{i-1}) * Rot_z(theta_i) * Trans_z(d_i)
@@ -13,6 +13,8 @@ DH規約（Modified DH / Craig規約）:
 
 import numpy as np
 from dataclasses import dataclass, field
+from .base import KinematicModel
+from .observation import vec6_to_se3
 
 
 @dataclass
@@ -252,3 +254,92 @@ def numerical_jacobian_dtheta(
         p_minus = kin.forward(q_minus, T_tool, T_local)[:3, 3]
         J[:, i] = (p_plus - p_minus) / (2 * eps)
     return J
+
+
+def build_kinematic_from_params(
+    dh_nominal: list[dict],
+    params,
+    param_lookup: dict,
+) -> "RobotKinematics":
+    """名目DH + 誤差パラメータから RobotKinematics を構築する。"""
+    dh_list = []
+    for i, dh in enumerate(dh_nominal):
+        d_alpha = params.params[param_lookup[f"d_alpha_{i}"]].value
+        d_a     = params.params[param_lookup[f"d_a_{i}"]].value
+        d_d     = params.params[param_lookup[f"d_d_{i}"]].value
+        d_theta = params.params[param_lookup[f"d_theta_offset_{i}"]].value
+        dh_list.append(DHParams(
+            alpha        = dh["alpha"]        + d_alpha,
+            a            = dh["a"]            + d_a,
+            d            = dh["d"]            + d_d,
+            theta_offset = dh["theta_offset"] + d_theta,
+        ))
+    return RobotKinematics(dh_list)
+
+
+def apply_transmission_error(
+    q: np.ndarray,
+    params,
+    param_lookup: dict,
+    n_joints: int,
+) -> np.ndarray:
+    """
+    関節角度伝達誤差モデルを適用する。
+
+    q_actual[i] = q[i] + amp[i] * sin(q[i] + phase[i])
+    """
+    q_corrected = q.copy()
+    for i in range(n_joints):
+        key_amp   = f"trans_err_amp_{i}"
+        key_phase = f"trans_err_phase_{i}"
+        if key_amp in param_lookup and key_phase in param_lookup:
+            amp   = params.params[param_lookup[key_amp]].value
+            phase = params.params[param_lookup[key_phase]].value
+            q_corrected[i] += amp * np.sin(q[i] + phase)
+    return q_corrected
+
+
+class DHKinematics(KinematicModel):
+    """
+    Modified DH パラメータによる順運動学。
+
+    params キー（すべて Optional、省略時は 0.0）:
+      d_alpha_i, d_a_i, d_d_i, d_theta_offset_i  — DH 誤差（i=0..n-1）
+      tool_tx/ty/tz, tool_rx/ry/rz               — ツール変換誤差 [m, rad]
+      local_tx/ty/tz, local_rx/ry/rz             — ローカル座標系誤差
+      time_offset                                 — 時刻ずれ（pipeline 側で補間）
+
+    レシピ側でサブクラス化して forward() をオーバーライドすれば
+    任意の追加モデル（重力補償項・フレキシビリティなど）を追加できる。
+    """
+
+    def __init__(self, dh_nominal: list[dict]):
+        self.dh_nominal = dh_nominal
+        self.n_joints = len(dh_nominal)
+
+    def _build_kin(self, params: dict) -> tuple[RobotKinematics, np.ndarray, np.ndarray]:
+        dh_list = [
+            DHParams(
+                alpha=dh["alpha"] + params.get(f"d_alpha_{i}", 0.0),
+                a=dh["a"]         + params.get(f"d_a_{i}",     0.0),
+                d=dh["d"]         + params.get(f"d_d_{i}",     0.0),
+                theta_offset=dh["theta_offset"] + params.get(f"d_theta_offset_{i}", 0.0),
+            )
+            for i, dh in enumerate(self.dh_nominal)
+        ]
+        T_tool  = vec6_to_se3(np.array([params.get(k, 0.0)
+                               for k in ["tool_tx","tool_ty","tool_tz",
+                                         "tool_rx","tool_ry","tool_rz"]]))
+        T_local = vec6_to_se3(np.array([params.get(k, 0.0)
+                               for k in ["local_tx","local_ty","local_tz",
+                                         "local_rx","local_ry","local_rz"]]))
+        return RobotKinematics(dh_list), T_tool, T_local
+
+    def forward(self, q: np.ndarray, params: dict) -> np.ndarray:
+        kin, T_tool, T_local = self._build_kin(params)
+        return kin.forward(q, T_tool, T_local)   # (4, 4) SE(3)
+
+    def jacobian(self, q: np.ndarray, params: dict) -> np.ndarray:
+        """関節角度に対する位置ヤコビアン ∂p/∂q ∈ R^{3 × n_joints}。"""
+        kin, T_tool, T_local = self._build_kin(params)
+        return kin.jacobian_position(q, T_tool, T_local)

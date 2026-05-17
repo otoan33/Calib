@@ -14,7 +14,8 @@ from scipy.interpolate import interp1d
 
 from .models.base import KinematicModel, ObservationModel
 from .models.parameters import ParameterSet, Parameter
-from .models.transforms import ObservationTransform, IdentityTransform
+from .models.base import ObservationTransform
+from .models.matrix import IdentityTransform
 from .estimation.optimizer import Stage, StageResult
 from .estimation.uncertainty import laplace_uncertainty, UncertaintyResult
 

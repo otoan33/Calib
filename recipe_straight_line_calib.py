@@ -36,7 +36,7 @@ from robot_calibration import (
     run_calibration, compute_uncertainty,
     DHKinematics, PoseObservation, Parameter, Stage,
 )
-from robot_calibration.models.transforms import IdentityTransform
+from robot_calibration.models.matrix import IdentityTransform
 from robot_calibration.visualization.plotter import plot_calibration_summary
 
 # ── ロボット定義（UR5 近似） ──────────────────────────────────────────────────

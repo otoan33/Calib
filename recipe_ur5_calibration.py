@@ -18,9 +18,10 @@ UR5 キャリブレーションレシピ（例）。
 import numpy as np
 from pathlib import Path
 
-from robot_calibration.models.defaults import DHKinematics, PoseObservation
+from robot_calibration.models.kinematics import DHKinematics
+from robot_calibration.models.observation import PoseObservation
 from robot_calibration.models.parameters import Parameter
-from robot_calibration.models.transforms import IdentityTransform
+from robot_calibration.models.matrix import IdentityTransform
 from robot_calibration.estimation.optimizer import Stage
 from robot_calibration.pipeline import run_calibration, compute_uncertainty
 from robot_calibration.visualization.plotter import plot_calibration_summary

@@ -17,10 +17,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from robot_calibration.models.defaults import DHKinematics, DistanceObservation
+from robot_calibration.models.kinematics import DHKinematics
+from robot_calibration.models.observation import DistanceObservation
 from robot_calibration.models.parameters import Parameter
 from robot_calibration.estimation.optimizer import Stage
-from robot_calibration.models.transforms import IdentityTransform
+from robot_calibration.models.matrix import IdentityTransform
 from robot_calibration.pipeline import run_calibration, compute_uncertainty
 
 # ── ロボット定義 ──────────────────────────────────────────────────────────────

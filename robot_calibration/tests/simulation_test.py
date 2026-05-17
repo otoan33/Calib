@@ -22,12 +22,11 @@ from robot_calibration.models.kinematics import (
     RobotKinematics, DHParams, numerical_jacobian_dtheta,
 )
 from robot_calibration.models.parameters import ParameterSet, Parameter, make_default_parameter_set
-from robot_calibration.models.transforms import (
+from robot_calibration.models.matrix import (
     IdentityTransform, VelocityNormTransform, FFTAmplitudeTransform,
 )
-from robot_calibration.models.residuals import (
-    build_kinematic_from_params, compute_residuals,
-)
+from robot_calibration.models.kinematics import build_kinematic_from_params
+from robot_calibration.estimation.optimizer import compute_residuals
 from robot_calibration.models.observation import vec6_to_se3
 from robot_calibration.estimation.optimizer import Stage, run_staged_optimization
 from robot_calibration.estimation.uncertainty import laplace_uncertainty
@@ -344,7 +343,7 @@ def test_transmission_error_identification():
     ここでは汎用の IdentityTransform を使って伝達誤差を直接同定する。
     """
     print("\n=== Transmission error identification test ===")
-    from robot_calibration.models.residuals import apply_transmission_error
+    from robot_calibration.models.kinematics import apply_transmission_error
 
     TRUE_AMP_0   = np.deg2rad(0.08)   # 0.08deg の伝達誤差振幅
     TRUE_PHASE_0 = 0.3                # 位相
