@@ -26,6 +26,34 @@ class DHParams:
     theta_offset: float  # 関節角度オフセット [rad]（名目値からのずれ）
 
 
+def _dh_transform_batch(alpha: float, a: float, d: float, theta: np.ndarray) -> np.ndarray:
+    """
+    DH 変換行列のバッチ版。theta: (N,) → T: (N, 4, 4)
+
+    dh_transform を N 回呼ぶ代わりに NumPy 演算で一括計算する。
+    """
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    ca = np.cos(alpha)
+    sa = np.sin(alpha)
+
+    N = len(theta)
+    T = np.zeros((N, 4, 4))
+    T[:, 0, 0] = ct
+    T[:, 0, 1] = -st
+    T[:, 0, 3] = a
+    T[:, 1, 0] = st * ca
+    T[:, 1, 1] = ct * ca
+    T[:, 1, 2] = -sa
+    T[:, 1, 3] = -d * sa
+    T[:, 2, 0] = st * sa
+    T[:, 2, 1] = ct * sa
+    T[:, 2, 2] = ca
+    T[:, 2, 3] = d * ca
+    T[:, 3, 3] = 1.0
+    return T
+
+
 def dh_transform(alpha: float, a: float, d: float, theta: float) -> np.ndarray:
     """
     Modified DH変換行列 T_i ∈ SE(3) を計算する。
@@ -128,6 +156,35 @@ class RobotKinematics:
             theta = q[i] + p.theta_offset
             T = T @ dh_transform(p.alpha, p.a, p.d, theta)
 
+        return T_local @ T @ T_tool
+
+    def forward_batch(
+        self,
+        q_batch: np.ndarray,
+        T_tool: np.ndarray = None,
+        T_local: np.ndarray = None,
+    ) -> np.ndarray:
+        """
+        N 点一括順運動学。q_batch: (N, n_joints) → T: (N, 4, 4)
+
+        各リンク行列を _dh_transform_batch で一括生成し、
+        NumPy のバッチ行列積（@ 演算子）で逐次合成する。
+        Python ループは関節数（6 程度）だけで、点数 N には依存しない。
+        """
+        if T_tool is None:
+            T_tool = np.eye(4)
+        if T_local is None:
+            T_local = np.eye(4)
+
+        N = len(q_batch)
+        T = np.eye(4)[None].repeat(N, axis=0)  # (N, 4, 4)
+
+        for i, p in enumerate(self.dh_params):
+            theta = q_batch[:, i] + p.theta_offset  # (N,)
+            Ti = _dh_transform_batch(p.alpha, p.a, p.d, theta)  # (N, 4, 4)
+            T = T @ Ti  # (N,4,4) @ (N,4,4) → (N,4,4)
+
+        # T_local: (4,4) @ (N,4,4) → (N,4,4)、T_tool: (N,4,4) @ (4,4) → (N,4,4)
         return T_local @ T @ T_tool
 
     def link_transforms(
@@ -338,6 +395,11 @@ class DHKinematics(KinematicModel):
     def forward(self, q: np.ndarray, params: dict) -> np.ndarray:
         kin, T_tool, T_local = self._build_kin(params)
         return kin.forward(q, T_tool, T_local)   # (4, 4) SE(3)
+
+    def forward_batch(self, q_batch: np.ndarray, params: dict) -> np.ndarray:
+        """N 点一括順運動学。q_batch: (N, n_joints) → T: (N, 4, 4)"""
+        kin, T_tool, T_local = self._build_kin(params)
+        return kin.forward_batch(q_batch, T_tool, T_local)
 
     def jacobian(self, q: np.ndarray, params: dict) -> np.ndarray:
         """関節角度に対する位置ヤコビアン ∂p/∂q ∈ R^{3 × n_joints}。"""

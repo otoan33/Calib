@@ -24,6 +24,25 @@ def _params_to_dict(ps: ParameterSet) -> dict:
     return {p.name: p.value for p in ps.params}
 
 
+def _build_interps(
+    q_timestamps: np.ndarray,
+    q_traj: np.ndarray,
+) -> list:
+    """
+    関節角度補間器をまとめて生成する（スプライン係数は固定なので1度だけ作る）。
+
+    戻り値: interp1d のリスト（関節数分）
+    """
+    return [
+        interp1d(
+            q_timestamps, q_traj[:, j], kind="cubic",
+            bounds_error=False,
+            fill_value=(q_traj[0, j], q_traj[-1, j]),
+        )
+        for j in range(q_traj.shape[1])
+    ]
+
+
 def _compute_residuals(
     x: np.ndarray,
     free_indices: list[int],
@@ -35,39 +54,31 @@ def _compute_residuals(
     transform: ObservationTransform,
     include_prior: bool = True,
     q_timestamps: np.ndarray | None = None,
+    interps: list | None = None,
 ) -> np.ndarray:
     """
     残差ベクトルを計算して返す。scipy.optimize.least_squares の fun 引数として使用。
 
-    time_offset パラメータが params に存在し q_timestamps が与えられた場合、
-    cubic 補間でシフトした関節角度を使って FK を評価する。
+    interps: _build_interps で事前生成した補間器リスト。
+             None のときは q_timestamps から都度生成（互換性のため残す）。
     """
     params.set_vector(free_indices, x)
     pdict = _params_to_dict(params)
 
     N = len(q_traj)
 
-    # time_offset 補間
+    # time_offset 補間（補間器はキャッシュ済みのものを使う）
     if q_timestamps is not None and "time_offset" in pdict:
         dt = pdict["time_offset"]
         t_eff = q_timestamps + dt
-        q_eff = np.column_stack([
-            interp1d(
-                q_timestamps, q_traj[:, j], kind="cubic",
-                bounds_error=False,
-                fill_value=(q_traj[0, j], q_traj[-1, j]),
-            )(t_eff)
-            for j in range(q_traj.shape[1])
-        ])
+        _interps = interps or _build_interps(q_timestamps, q_traj)
+        q_eff = np.column_stack([f(t_eff) for f in _interps])
     else:
         q_eff = q_traj
 
-    # 予測値をモデル経由で計算
-    preds = []
-    for t in range(N):
-        pose = kin_model.forward(q_eff[t], pdict)
-        preds.append(obs_model.predict(pose, pdict))
-    y_pred = np.concatenate(preds)
+    # 予測値をバッチで計算
+    poses = kin_model.forward_batch(q_eff, pdict)   # (N, 4, 4)
+    y_pred = obs_model.predict_batch(poses, pdict)   # (N * obs_dim,)
 
     # 変換モードで残差計算方法を切り替え
     if getattr(transform, "transform_mode", "split") == "residual":
@@ -129,6 +140,9 @@ def run_calibration(
     y_exp_flat = np.asarray(y_exp).flatten()
     results: list[StageResult] = []
 
+    # 補間器を1度だけ生成（スプライン係数はデータが変わらない限り再利用できる）
+    interps = _build_interps(q_timestamps, q_traj) if q_timestamps is not None else None
+
     def _run_stage(stage: Stage) -> StageResult:
         free_idx = params.free_indices(groups=stage.param_groups)
         if not free_idx:
@@ -141,6 +155,7 @@ def run_calibration(
             q_traj, y_exp_flat, stage.transform,
             include_prior=True,
             q_timestamps=q_timestamps,
+            interps=interps,
         )
         res = least_squares(fun, x0, **ls_kwargs)
         params.set_vector(free_idx, res.x)
@@ -185,12 +200,14 @@ def compute_uncertainty(
 
     y_flat = np.asarray(y_exp).flatten()
     free_idx = params.free_indices(groups=None)
+    interps = _build_interps(q_timestamps, q_traj) if q_timestamps is not None else None
 
     fun = lambda x: _compute_residuals(
         x, free_idx, params, kin_model, obs_model,
         q_traj, y_flat, transform,
         include_prior=False,
         q_timestamps=q_timestamps,
+        interps=interps,
     )
     x0 = params.get_vector(free_idx)
     res = least_squares(fun, x0, method="lm", max_nfev=1)  # 1 ステップで Jacobian だけ取得

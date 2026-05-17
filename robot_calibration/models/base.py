@@ -56,6 +56,15 @@ class KinematicModel(ABC):
         """
         ...
 
+    def forward_batch(self, q_batch: np.ndarray, params: dict) -> np.ndarray:
+        """
+        N 点一括順運動学。q_batch: (N, n_joints) → T: (N, 4, 4)
+
+        デフォルト実装はループ。サブクラスで NumPy バッチ演算に差し替えると高速化される。
+        カスタム KinematicModel は forward() だけ実装すれば自動的にこのデフォルトが使われる。
+        """
+        return np.stack([self.forward(q, params) for q in q_batch])
+
     def numerical_jacobian(
         self,
         q: np.ndarray,
@@ -92,3 +101,11 @@ class ObservationModel(ABC):
           姿勢込み: (6,) など
         """
         ...
+
+    def predict_batch(self, poses: np.ndarray, params: dict) -> np.ndarray:
+        """
+        N 点一括観測予測。poses: (N, 4, 4) → y: (N * obs_dim,)
+
+        デフォルト実装はループ。サブクラスで高速版に差し替え可能。
+        """
+        return np.concatenate([self.predict(T, params) for T in poses])

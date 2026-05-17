@@ -67,6 +67,10 @@ class PoseObservation(ObservationModel):
     def predict(self, x: np.ndarray, params: dict) -> np.ndarray:
         return x[:3, 3]
 
+    def predict_batch(self, poses: np.ndarray, params: dict) -> np.ndarray:
+        """poses: (N, 4, 4) → (N*3,)"""
+        return poses[:, :3, 3].flatten()
+
 
 class DistanceObservation(ObservationModel):
     """
@@ -81,3 +85,7 @@ class DistanceObservation(ObservationModel):
 
     def predict(self, x: np.ndarray, params: dict) -> np.ndarray:
         return np.array([np.linalg.norm(x[:3, 3] - self.origin)])
+
+    def predict_batch(self, poses: np.ndarray, params: dict) -> np.ndarray:
+        """poses: (N, 4, 4) → (N,)"""
+        return np.linalg.norm(poses[:, :3, 3] - self.origin, axis=1)
