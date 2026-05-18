@@ -19,7 +19,7 @@ from .models.parameters import ParameterSet, Parameter
 from .models.base import ObservationTransform
 from .models.matrix import IdentityTransform
 from .estimation.optimizer import Stage, StageResult
-from .estimation.uncertainty import laplace_uncertainty, UncertaintyResult
+from .estimation.uncertainty import laplace_uncertainty, UncertaintyResult, propagate_to_position
 
 
 @dataclass
@@ -31,10 +31,49 @@ class SequentialStep:
     param_values: np.ndarray     # 推定値
     param_stds: np.ndarray       # Laplace 近似による 1σ 不確かさ
     residual_rms: float          # 観測残差の RMS（観測値と同じ単位）
+    pos_unc_mean: float          # 手先位置不確かさの評価点平均 sqrt(trace(Cov_p)) [m]
+    pos_unc_xyz: np.ndarray      # 軸ごとの位置不確かさ平均 (obs_dim,) [m]
 
 
 def _params_to_dict(ps: ParameterSet) -> dict:
     return {p.name: p.value for p in ps.params}
+
+
+def _compute_param_jacobian(
+    kin_model: KinematicModel,
+    obs_model: ObservationModel,
+    q_eval: np.ndarray,
+    params: ParameterSet,
+    free_indices: list[int],
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, int]:
+    """
+    パラメータに対する観測値のヤコビアン ∂y(q)/∂θ を数値微分で計算する。
+
+    任意の KinematicModel・ObservationModel に対して動作する。
+    forward_batch を使うので N 点分を各パラメータ1回の FK 呼び出しで評価する。
+
+    Returns
+    -------
+    J        : (M * obs_dim, n_free)  各評価点でのパラメータヤコビアン
+    obs_dim  : 観測次元（PoseObservation=3 など）
+    """
+    pdict0 = _params_to_dict(params)
+    poses0 = kin_model.forward_batch(q_eval, pdict0)
+    y0 = obs_model.predict_batch(poses0, pdict0)          # (M * obs_dim,)
+    obs_dim = len(y0) // len(q_eval)
+
+    J = np.zeros((len(y0), len(free_indices)))
+    for j, idx in enumerate(free_indices):
+        orig = params.params[idx].value
+        params.params[idx].value = orig + eps
+        pdict_p = _params_to_dict(params)
+        poses_p = kin_model.forward_batch(q_eval, pdict_p)
+        y_p = obs_model.predict_batch(poses_p, pdict_p)
+        J[:, j] = (y_p - y0) / eps
+        params.params[idx].value = orig               # 復元
+
+    return J, obs_dim
 
 
 def _build_interps(
@@ -226,7 +265,7 @@ def compute_uncertainty(
     res = least_squares(fun, x0, method="lm", max_nfev=1)  # 1 ステップで Jacobian だけ取得
 
     free_names = [params.params[i].name for i in free_idx]
-    return laplace_uncertainty(res.jac, free_names, x0)
+    return laplace_uncertainty(res.jac, free_names, x0, residuals=res.fun)
 
 
 def run_sequential_calibration(
@@ -240,6 +279,8 @@ def run_sequential_calibration(
     ls_kwargs: dict = None,
     q_timestamps: np.ndarray | None = None,
     update_prior: bool = True,
+    q_eval: np.ndarray | None = None,
+    n_eval: int = 100,
 ) -> list[SequentialStep]:
     """
     データを n_groups に分割し、累積データ量を増やしながら逐次推定する。
@@ -249,24 +290,28 @@ def run_sequential_calibration(
     n_groups     : 分割数。各ステップで使うデータ数は N/n_groups ずつ増える。
     update_prior : True（デフォルト）のとき、前ステップの事後分布を次の事前分布に設定
                    する（逐次ベイズ推定）。False のとき毎ステップ独立推定（収束比較用）。
+    q_eval       : 手先位置不確かさの評価に使う関節角度配列 (M, n_joints)。
+                   None のとき訓練データから n_eval 点を等間隔サンプリングして使う。
+    n_eval       : q_eval=None のとき使う評価点数（上限）。
 
     戻り値
     ------
-    list[SequentialStep]  n_groups 個。各要素に推定値・不確かさ・RMS を含む。
-
-    使い方
-    ------
-    steps = run_sequential_calibration(...)
-    fig   = plot_sequential_convergence(steps, param_filter=["d_a_0", "d_a_1"])
+    list[SequentialStep]  n_groups 個。各要素に推定値・不確かさ・RMS・位置不確かさを含む。
     """
     N = len(q_traj)
     y_flat_all = np.asarray(y_exp).flatten()
     obs_dim = len(y_flat_all) // N
 
+    # 手先位置不確かさの評価点（固定。訓練データから等間隔サンプリング）
+    if q_eval is None:
+        idx_eval = np.round(np.linspace(0, N - 1, min(n_eval, N))).astype(int)
+        q_eval_fixed = q_traj[idx_eval]
+    else:
+        q_eval_fixed = np.asarray(q_eval)
+
     # 各ステップのデータ終端インデックス（等間隔、最後は端まで）
     edges = np.round(np.linspace(0, N, n_groups + 1)).astype(int)
 
-    # warm-start 用パラメータ（ステップをまたいで値・事前分布を更新する）
     working_params = copy.deepcopy(parameters)
     steps: list[SequentialStep] = []
 
@@ -290,11 +335,21 @@ def run_sequential_calibration(
             q_sub, y_sub, q_timestamps=ts_sub,
         )
 
-        # 残差 RMS（time_offset 補間なしの単純予測で十分）
+        # 残差 RMS
         pdict = _params_to_dict(params_g)
         poses = kinematic_model.forward_batch(q_sub, pdict)
         y_pred = observation_model.predict_batch(poses, pdict)
         rms = float(np.sqrt(np.mean((y_sub - y_pred) ** 2)))
+
+        # パラメータ共分散 → 手先位置不確かさへの伝播
+        free_idx = params_g.free_indices()
+        J_param, obs_dim_eval = _compute_param_jacobian(
+            kinematic_model, observation_model,
+            q_eval_fixed, params_g, free_idx,
+        )
+        sigma_pos, sigma_xyz = propagate_to_position(unc.cov, J_param, obs_dim_eval)
+        pos_unc_mean = float(np.mean(sigma_pos))
+        pos_unc_xyz  = np.mean(sigma_xyz, axis=0)
 
         steps.append(SequentialStep(
             n_data=n_data,
@@ -303,10 +358,11 @@ def run_sequential_calibration(
             param_values=unc.means.copy(),
             param_stds=unc.stds.copy(),
             residual_rms=rms,
+            pos_unc_mean=pos_unc_mean,
+            pos_unc_xyz=pos_unc_xyz,
         ))
 
         if update_prior:
-            # 事後分布 → 次ステップの事前分布（逐次ベイズ更新）
             val_map = dict(zip(unc.param_names, unc.means))
             std_map = dict(zip(unc.param_names, unc.stds))
             for p in params_g.params:
@@ -314,10 +370,12 @@ def run_sequential_calibration(
                     p.prior_mean = val_map[p.name]
                     p.prior_std  = max(std_map[p.name], 1e-9)
 
-        # working_params を次ステップの warm-start として引き継ぐ
-        # （params_g.params は working_params と同一オブジェクトなので代入不要）
         working_params = params_g.params
 
-        print(f"[group {g+1}/{n_groups}]  n={n_data:5d}  RMS={rms*1e3:.3f} mm")
+        print(
+            f"[group {g+1}/{n_groups}]  n={n_data:5d}"
+            f"  RMS={rms*1e3:.3f} mm"
+            f"  pos_unc={pos_unc_mean*1e3:.3f} mm"
+        )
 
     return steps

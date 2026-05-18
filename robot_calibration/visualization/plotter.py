@@ -207,10 +207,10 @@ def plot_calibration_summary(
 
 def plot_sequential_convergence(
     steps: list,
+    pos_scale: float = 1e3,
+    pos_unit: str = "mm",
     param_filter: list[str] | None = None,
     true_values: dict[str, float] | None = None,
-    rms_scale: float = 1e3,
-    rms_unit: str = "mm",
     n_cols: int = 3,
     title: str = "Sequential Estimation Convergence",
     save_path=None,
@@ -218,84 +218,108 @@ def plot_sequential_convergence(
     """
     逐次推定（run_sequential_calibration）の収束プロット。
 
+    Layout
+    ------
+    上段（2列）: 手先位置不確かさ（スカラー + XYZ 成分）vs データ数  ← メイン
+    下段グリッド: パラメータ推定値 ± 1σ vs データ数（param_filter で絞り込み可）
+
     Parameters
     ----------
     steps        : run_sequential_calibration の戻り値
-    param_filter : 表示するパラメータ名のリスト。None のとき全 free パラメータを表示。
-    true_values  : 真値辞書（シミュレーション時に重ねて表示）
-    rms_scale    : 残差 RMS に掛けるスケール係数（デフォルト 1e3 → mm）
-    rms_unit     : RMS 軸のラベル単位
-    save_path    : 保存先パス（str / Path）。指定時は保存して図を閉じる。None のとき保存しない。
+    pos_scale    : 位置不確かさに掛けるスケール係数（デフォルト 1e3 → mm）
+    pos_unit     : 位置不確かさ軸のラベル単位
+    param_filter : 下段に表示するパラメータ名リスト。None のとき表示しない。
+    true_values  : 真値辞書（パラメータ下段に重ねて表示）
     n_cols       : パラメータサブプロットの列数
-    title        : 図タイトル
-
-    Layout
-    ------
-    最上段: 残差 RMS vs データ数
-    残り  : パラメータ推定値 ± 1σ vs データ数（n_cols 列のグリッド）
+    save_path    : 保存先パス。指定時は dpi=150 で保存して figure を閉じる。
     """
     if not steps:
         raise ValueError("steps が空です。")
 
-    all_names = steps[0].param_names
-    names = param_filter if param_filter is not None else all_names
-    names = [n for n in names if n in all_names]
-    if not names:
-        raise ValueError(f"param_filter に該当するパラメータがありません: {param_filter}")
+    n_data_arr  = np.array([s.n_data        for s in steps])
+    pos_unc     = np.array([s.pos_unc_mean  for s in steps]) * pos_scale
+    pos_unc_xyz = np.stack([s.pos_unc_xyz   for s in steps]) * pos_scale  # (G, obs_dim)
+    rmss        = np.array([s.residual_rms  for s in steps]) * pos_scale
 
-    n_data_arr = np.array([s.n_data for s in steps])
-    name_to_idx = {n: i for i, n in enumerate(all_names)}
-    sel_idx = [name_to_idx[n] for n in names]
+    obs_dim  = pos_unc_xyz.shape[1]
+    xyz_labels = ["X", "Y", "Z"][:obs_dim]
+    xyz_colors = ["#E07B54", "#4CAF50", "#9B59B6"][:obs_dim]
+    color_main = "#4C9BE8"
+    color_band = "#AED4F5"
+    color_true = "#E07B54"
 
-    vals = np.array([s.param_values[sel_idx] for s in steps])   # (G, P)
-    stds = np.array([s.param_stds[sel_idx]   for s in steps])   # (G, P)
-    rmss = np.array([s.residual_rms           for s in steps]) * rms_scale
+    # 下段パラメータグリッドの有無
+    show_params = param_filter is not None and len(param_filter) > 0
+    if show_params:
+        all_names   = steps[0].param_names
+        names       = [n for n in param_filter if n in all_names]
+        show_params = len(names) > 0
 
-    n_params = len(names)
-    n_rows_params = (n_params + n_cols - 1) // n_cols
-    n_rows_total  = 1 + n_rows_params
+    n_rows_params = ((len(names) + n_cols - 1) // n_cols) if show_params else 0
+    n_rows_total  = 2 + n_rows_params   # 上段2行（位置不確かさ + RMS）+ 下段
 
     fig = plt.figure(
-        figsize=(5 * n_cols, 3 + 3 * n_rows_params),
+        figsize=(5 * n_cols, 3.5 * (2 + n_rows_params)),
         constrained_layout=True,
     )
     fig.suptitle(title, fontsize=12, fontweight="bold")
     gs = gridspec.GridSpec(n_rows_total, n_cols, figure=fig)
 
-    color_val  = "#4C9BE8"
-    color_band = "#AED4F5"
-    color_true = "#E07B54"
+    # ── 行0: スカラー位置不確かさ（全列使用）─────────────────────────────────
+    ax_pos = fig.add_subplot(gs[0, :])
+    ax_pos.plot(n_data_arr, pos_unc, "o-", color=color_main, lw=2, ms=5,
+                label=f"mean σ_pos [{pos_unit}]")
+    ax_pos.set_ylabel(f"Position uncertainty [{pos_unit}]")
+    ax_pos.set_title("End-effector position uncertainty  σ_pos = √tr(J Cov_θ Jᵀ)")
+    ax_pos.set_xlabel("data count")
+    ax_pos.legend(fontsize=8)
+    ax_pos.grid(True, alpha=0.4)
+    ax_pos.set_xlim(left=0)
 
-    # ── 最上段: 残差 RMS ──────────────────────────────────────────────────────
-    ax_rms = fig.add_subplot(gs[0, :])
-    ax_rms.plot(n_data_arr, rmss, "o-", color=color_val, lw=1.5, ms=4)
+    # ── 行1左: XYZ 成分別──────────────────────────────────────────────────────
+    n_xyz_cols = min(n_cols, 2)
+    ax_xyz = fig.add_subplot(gs[1, :n_xyz_cols])
+    for k, (lbl, col) in enumerate(zip(xyz_labels, xyz_colors)):
+        ax_xyz.plot(n_data_arr, pos_unc_xyz[:, k], "o-", color=col,
+                    lw=1.5, ms=4, label=f"σ_{lbl}")
+    ax_xyz.set_ylabel(f"σ per axis [{pos_unit}]")
+    ax_xyz.set_title("Per-axis position uncertainty")
+    ax_xyz.set_xlabel("data count")
+    ax_xyz.legend(fontsize=8)
+    ax_xyz.grid(True, alpha=0.4)
+    ax_xyz.set_xlim(left=0)
+
+    # ── 行1右: 残差 RMS（参考）────────────────────────────────────────────────
+    ax_rms = fig.add_subplot(gs[1, n_xyz_cols:])
+    ax_rms.plot(n_data_arr, rmss, "s--", color="#888888", lw=1.5, ms=4)
+    ax_rms.set_ylabel(f"Residual RMS [{pos_unit}]")
+    ax_rms.set_title("Observation residual RMS  (reference)")
     ax_rms.set_xlabel("data count")
-    ax_rms.set_ylabel(f"RMS [{rms_unit}]")
-    ax_rms.set_title("Residual RMS vs data count")
     ax_rms.grid(True, alpha=0.4)
     ax_rms.set_xlim(left=0)
 
-    # ── パラメータグリッド ────────────────────────────────────────────────────
-    for pi, name in enumerate(names):
-        row = 1 + pi // n_cols
-        col = pi % n_cols
-        ax = fig.add_subplot(gs[row, col])
+    # ── 下段: パラメータグリッド（オプション）────────────────────────────────
+    if show_params:
+        name_to_idx = {n: i for i, n in enumerate(steps[0].param_names)}
+        sel_idx = [name_to_idx[n] for n in names]
+        vals = np.array([s.param_values[sel_idx] for s in steps])
+        stds = np.array([s.param_stds[sel_idx]   for s in steps])
 
-        v = vals[:, pi]
-        s = stds[:, pi]
-
-        ax.fill_between(n_data_arr, v - s, v + s, alpha=0.3, color=color_band, label="±1σ")
-        ax.plot(n_data_arr, v, "o-", color=color_val, lw=1.5, ms=3, label="estimate")
-
-        if true_values is not None and name in true_values:
-            ax.axhline(true_values[name], color=color_true, lw=1.2, ls="--", label="true")
-
-        ax.set_title(name, fontsize=8)
-        ax.set_xlabel("data count", fontsize=7)
-        ax.set_xlim(left=0)
-        ax.grid(True, alpha=0.4)
-        if pi == 0:
-            ax.legend(fontsize=6)
+        for pi, name in enumerate(names):
+            row = 2 + pi // n_cols
+            col = pi % n_cols
+            ax = fig.add_subplot(gs[row, col])
+            v, s = vals[:, pi], stds[:, pi]
+            ax.fill_between(n_data_arr, v - s, v + s, alpha=0.3, color=color_band)
+            ax.plot(n_data_arr, v, "o-", color=color_main, lw=1.5, ms=3, label="estimate")
+            if true_values is not None and name in true_values:
+                ax.axhline(true_values[name], color=color_true, lw=1.2, ls="--", label="true")
+            ax.set_title(name, fontsize=8)
+            ax.set_xlabel("data count", fontsize=7)
+            ax.set_xlim(left=0)
+            ax.grid(True, alpha=0.4)
+            if pi == 0:
+                ax.legend(fontsize=6)
 
     _save(fig, save_path)
     return fig
